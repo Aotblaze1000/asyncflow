@@ -58,7 +58,8 @@ POST /api/uploads
 | Celery | Background workers |
 | Redis | Broker and result backend |
 | SQLAlchemy 2.0 | Persistence |
-| SQLite | Default database |
+| SQLite | Default database for local runs |
+| PostgreSQL | Database in the Compose stack |
 | pytest | Test suite |
 
 ## Layout
@@ -66,6 +67,7 @@ POST /api/uploads
 ```
 app/
   main.py                 application factory, health endpoint
+  bootstrap.py            schema + storage setup for containers
   api/uploads.py          upload endpoint
   api/jobs.py             job lookup, results, retry, recovery
   api/schemas.py          response models
@@ -74,13 +76,16 @@ app/
   models/job.py           job model and states
   services/attachment.py  validation, storage, inspection
   services/jobs.py        state transitions
-  workers/celery_app.py   Celery configuration
-  workers/tasks.py        run_job() state machine + Celery task
+  workers/celery_app.py   Celery configuration and beat schedule
+  workers/tasks.py        run_job() state machine + Celery tasks
 tests/
   test_uploads.py         upload validation and storage
   test_jobs.py            API behaviour
   test_workers.py         claiming, processing, idempotency
   test_failures.py        retries, permanent failures, recovery
+  test_concurrency.py     eight threads race for one job
+  test_postgres.py        same guarantees against PostgreSQL
+docker-compose.yml        api + worker + beat + redis + postgres
 ```
 
 ## Setup
@@ -88,19 +93,38 @@ tests/
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
-Start Redis (Docker Desktop must be running):
-
-```powershell
-docker run -d --name asyncflow-redis -p 6379:6379 redis:7-alpine
-```
+`requirements.txt` holds runtime dependencies; `requirements-dev.txt` adds the
+test tools.
 
 Configuration is read from environment variables prefixed with `ASYNCFFLOW_`
 (see `.env.example`).
 
 ## Running
+
+### Docker Compose (recommended)
+
+One command starts Redis, PostgreSQL, the API, a Celery worker and the beat
+scheduler:
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+- API and docs: <http://127.0.0.1:8000/docs>
+- Logs: `docker compose logs -f worker`
+- Stop: `docker compose down` (add `-v` to drop the database volume)
+
+### Locally, without Docker
+
+Start Redis:
+
+```powershell
+docker run -d --name asyncflow-redis -p 6379:6379 redis:7-alpine
+```
 
 API:
 
@@ -114,6 +138,12 @@ Worker (separate terminal):
 
 ```powershell
 celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+```
+
+Beat scheduler (separate terminal), which runs the stale-job sweep every 60s:
+
+```powershell
+celery -A app.workers.celery_app beat --loglevel=info
 ```
 
 The `solo` pool is convenient on Windows; production deployments normally use
@@ -144,12 +174,25 @@ curl.exe http://127.0.0.1:8000/api/jobs/<id>/result
 pytest -v
 pytest tests/test_workers.py -v
 pytest tests/test_failures.py -v
+pytest tests/test_concurrency.py -v
 ```
 
-The suite uses a temporary SQLite file per test and a recording stub for the
-broker, so it runs without Redis. Tests cover the concurrency-relevant paths:
-exclusive claiming, retry exhaustion, late-writer rejection and stale-job
-recovery.
+The default suite uses a temporary SQLite file per test and a recording stub for
+the broker, so it runs without Redis or Docker. Tests cover the
+concurrency-relevant paths: exclusive claiming under eight threads, retry
+exhaustion, late-writer rejection and stale-job recovery.
+
+PostgreSQL integration checks are skipped unless a database URL is provided:
+
+```powershell
+docker compose up -d db
+$env:ASYNCFFLOW_TEST_DATABASE_URL="postgresql+psycopg://asyncflow:asyncflow@localhost:5432/asyncflow"
+pytest tests/test_postgres.py -v
+```
+
+That file recreates the `jobs` table, then repeats the eight-thread claim race
+and a full process-and-persist cycle on PostgreSQL, proving the transitions do
+not depend on SQLite behaviour.
 
 ## Design notes
 
@@ -168,12 +211,23 @@ A delivery that lost its claim updates nothing.
 **Broker outages.** An upload whose enqueue fails returns `202` with
 `queued: false` and the job stays `pending`; the record is never dropped.
 
+**Crash recovery.** `acks_late` plus `task_reject_on_worker_lost` gets a message
+redelivered when a worker dies. If the job was mid-`processing`, the beat
+scheduler's sweep (every 60s) re-queues it once it has been stale for
+`ASYNCFFLOW_JOB_STALE_AFTER_SECONDS`. A job that died on its final attempt is
+closed as `failed` instead of being re-queued forever. The sweep also retries
+jobs stuck in `queued`, which covers a broker outage during `delay()`.
+
+**Duplicate deliveries are harmless.** Every path that can hand the same job to
+two workers ends in `claim_job()`, and the loser gets `None`. Re-queueing a job
+that is already being processed cannot corrupt it.
+
 ## Limitations
 
 - Processing is intentionally format-light: text statistics for text-like files,
   checksum and size for binary/PDF. It is not a document converter.
-- SQLite is the default; the schema uses portable SQLAlchemy types so PostgreSQL
-  works by changing `ASYNCFFLOW_DATABASE_URL`.
+- SQLite is the default for local runs and tests; the Compose stack uses
+  PostgreSQL with the same code paths.
 - Authentication is out of scope; put the API behind an authenticating gateway.
 
 ## License

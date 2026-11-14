@@ -1,0 +1,96 @@
+name: asyncflow
+
+x-app: &app
+  build: .
+  image: asyncflow:local
+  restart: unless-stopped
+  environment: &app-env
+    ASYNCFFLOW_DATABASE_URL: postgresql+psycopg://asyncflow:asyncflow@db:5432/asyncflow
+    ASYNCFFLOW_REDIS_URL: redis://redis:6379/0
+    ASYNCFFLOW_STORAGE_DIR: /app/storage
+    ASYNCFFLOW_ENVIRONMENT: docker
+    ASYNCFFLOW_JOB_STALE_AFTER_SECONDS: "120"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: asyncflow
+      POSTGRES_PASSWORD: asyncflow
+      POSTGRES_DB: asyncflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asyncflow -d asyncflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command:
+      - sh
+      - -c
+      - python -m app.bootstrap && celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    <<: *app
+    command:
+      - sh
+      - -c
+      - python -m app.bootstrap && celery -A app.workers.celery_app beat --loglevel=info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  storage:
