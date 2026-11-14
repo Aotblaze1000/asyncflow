@@ -130,6 +130,4 @@ def recover_stale_jobs(
         db, older_than_seconds or None
     )
     queued = [job_id for job_id in recovered if job_service.enqueue(job_id)]
-    for job_id in queued:
-        job_service.mark_queued(db, job_id)
     return {"recovered": recovered, "queued": queued}

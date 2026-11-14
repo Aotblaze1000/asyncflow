@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -186,35 +186,73 @@ def enqueue(job_id: str) -> bool:
 
 
 def reset_stale_jobs(db: Session, older_than_seconds: int | None = None) -> list[str]:
-    """Re-queue jobs whose worker died mid-processing.
+    """Recover jobs that no worker is going to finish.
 
-    Returns the ids that were recovered.
+    Two situations are handled:
+
+    * a job left in ``processing`` because its worker died (exhausted jobs are
+      closed as failed instead of being re-queued forever);
+    * a job left in ``queued``/``retrying`` because the broker call never
+      reached a worker, for example during a short Redis outage.
+
+    Returns the ids that were made claimable again.
     """
 
     timeout = older_than_seconds or settings.job_stale_after_seconds
     cutoff = utcnow() - timedelta(seconds=timeout)
 
-    stale_ids = list(
+    stale = list(
         db.scalars(
-            select(Job.id).where(
-                Job.status == JobStatus.PROCESSING.value,
-                Job.started_at.is_not(None),
-                Job.started_at < cutoff,
+            select(Job).where(
+                or_(
+                    and_(
+                        Job.status == JobStatus.PROCESSING.value,
+                        Job.started_at.is_not(None),
+                        Job.started_at < cutoff,
+                    ),
+                    and_(
+                        Job.status.in_(
+                            [JobStatus.QUEUED.value, JobStatus.RETRYING.value]
+                        ),
+                        Job.updated_at < cutoff,
+                    ),
+                )
             )
         )
     )
-    if not stale_ids:
-        return []
 
-    for job_id in stale_ids:
-        db.execute(
+    requeued: list[str] = []
+    for job in stale:
+        if (
+            job.status == JobStatus.PROCESSING.value
+            and job.attempts >= job.max_retries
+        ):
+            db.execute(
+                update(Job)
+                .where(Job.id == job.id, Job.status == JobStatus.PROCESSING.value)
+                .values(
+                    status=JobStatus.FAILED.value,
+                    last_error=(
+                        f"Abandoned after {job.attempts} attempt(s): the worker "
+                        "stopped before the job finished"
+                    ),
+                    finished_at=utcnow(),
+                    updated_at=utcnow(),
+                )
+            )
+            continue
+
+        result = db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status == JobStatus.PROCESSING.value)
+            .where(Job.id == job.id, Job.status == job.status)
             .values(
                 status=JobStatus.QUEUED.value,
-                last_error="Worker stopped before the job finished; re-queued",
+                last_error="Recovered by the stale-job sweep; re-queued",
                 updated_at=utcnow(),
             )
         )
+        if result.rowcount == 1:
+            requeued.append(job.id)
+
     db.commit()
-    return stale_ids
+    return requeued

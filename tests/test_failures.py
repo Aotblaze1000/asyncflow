@@ -111,6 +111,61 @@ def test_stale_processing_job_is_requeued(
     assert "re-queued" in (stored.last_error or "")
 
 
+def test_abandoned_job_with_no_attempts_left_is_failed(
+    db_session: Session, storage: Path
+) -> None:
+    job = make_job(db_session, storage, status=JobStatus.PROCESSING.value)
+    job.attempts = 3
+    job.max_retries = 3
+    job.started_at = utcnow() - timedelta(seconds=600)
+    db_session.commit()
+
+    recovered = job_service.reset_stale_jobs(db_session, older_than_seconds=300)
+
+    # Re-queueing it would only produce a job that can never be claimed.
+    assert recovered == []
+
+    db_session.expire_all()
+    stored = db_session.get(Job, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.FAILED.value
+    assert "Abandoned after 3 attempt(s)" in (stored.last_error or "")
+    assert stored.finished_at is not None
+
+
+def test_queued_job_that_never_reached_a_worker_is_requeued(
+    db_session: Session, storage: Path
+) -> None:
+    job = make_job(db_session, storage, status=JobStatus.QUEUED.value)
+    job.updated_at = utcnow() - timedelta(seconds=900)
+    db_session.commit()
+
+    recovered = job_service.reset_stale_jobs(db_session, older_than_seconds=300)
+
+    assert recovered == [job.id]
+
+    db_session.expire_all()
+    stored = db_session.get(Job, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.QUEUED.value
+    assert "stale-job sweep" in (stored.last_error or "")
+
+
+def test_a_freshly_queued_job_is_not_disturbed(
+    db_session: Session, storage: Path
+) -> None:
+    job = make_job(db_session, storage, status=JobStatus.QUEUED.value)
+
+    recovered = job_service.reset_stale_jobs(db_session, older_than_seconds=300)
+
+    assert recovered == []
+    db_session.expire_all()
+    stored = db_session.get(Job, job.id)
+    assert stored is not None
+    assert stored.last_error is None
+
+
+
 def test_recent_processing_job_is_left_alone(
     db_session: Session, storage: Path
 ) -> None:

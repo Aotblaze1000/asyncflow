@@ -133,15 +133,23 @@ def process_job(self, job_id: str) -> str:  # noqa: ANN001
 
 @celery_app.task(name="asyncflow.recover_stale_jobs")
 def recover_stale_jobs() -> int:
-    """Periodic safety net for jobs whose worker disappeared."""
+    """Periodic safety net for jobs whose worker disappeared.
+
+    Jobs that cannot be handed back to the broker stay ``queued``; the next
+    sweep picks them up again, so a short broker outage delays work instead of
+    losing it.
+    """
 
     db = SessionLocal()
     try:
         recovered = job_service.reset_stale_jobs(db)
+        queued = [job_id for job_id in recovered if job_service.enqueue(job_id)]
+        if len(queued) != len(recovered):
+            logger.warning(
+                "Recovered %s jobs but re-queued %s; the rest will be retried by the next sweep",
+                len(recovered),
+                len(queued),
+            )
+        return len(queued)
     finally:
         db.close()
-
-    for job_id in recovered:
-        if job_service.enqueue(job_id):
-            job_service.mark_queued(db, job_id)
-    return len(recovered)

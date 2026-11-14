@@ -37,4 +37,10 @@ celery_app.conf.update(
     task_soft_time_limit=300,
     task_time_limit=360,
     task_default_queue="asyncflow",
+    beat_schedule={
+        "recover-stale-jobs": {
+            "task": "asyncflow.recover_stale_jobs",
+            "schedule": 60.0,
+        },
+    },
 )
