@@ -36,6 +36,9 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     task_soft_time_limit=300,
     task_time_limit=360,
+    # Give a shutdown signal enough room to finish the job it is running so its
+    # result is written before the process exits.
+    worker_soft_shutdown_timeout=30,
     task_default_queue="asyncflow",
     beat_schedule={
         "recover-stale-jobs": {

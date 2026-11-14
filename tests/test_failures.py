@@ -79,8 +79,35 @@ def test_unexpected_exception_marks_job_failed(
     assert stored.finished_at is not None
 
 
-def test_a_failed_job_is_never_claimable_again(
-    db_session: Session, session_factory: sessionmaker, storage: Path
+def test_soft_time_limit_is_retryable(
+    db_session: Session,
+    session_factory: sessionmaker,
+    storage: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow attempt must not permanently fail a job that had started."""
+
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    job = make_job(db_session, storage)
+
+    def _too_slow(*_args, **_kwargs):
+        raise SoftTimeLimitExceeded("300s exceeded")
+
+    monkeypatch.setattr("app.workers.tasks.process_attachment", _too_slow)
+
+    result = run_job(job.id, session_factory)
+
+    assert result.outcome is JobOutcome.RETRY
+
+    db_session.expire_all()
+    stored = db_session.get(Job, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.RETRYING.value
+    assert "SoftTimeLimitExceeded" in (stored.last_error or "")
+
+
+def test_a_failed_job_is_never_claimable_again(    db_session: Session, session_factory: sessionmaker, storage: Path
 ) -> None:
     job = make_job(db_session, storage)
     job.status = JobStatus.FAILED.value

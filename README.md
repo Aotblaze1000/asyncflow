@@ -48,6 +48,10 @@ POST /api/uploads
   sweep for jobs left in `processing` by a dead worker.
 - **Resource safety**: uploads stream through a temporary file that is removed on
   every failure path, and processing files are always closed.
+- **Request correlation**: every response carries an `X-Request-ID` header (client
+  supplied or generated) that also appears in the log line for that request.
+- **Structured startup**: container entrypoints wait for a database that is still
+  starting instead of crash-looping on the first refused connection.
 
 ## Stack
 
@@ -72,6 +76,7 @@ app/
   api/jobs.py             job lookup, results, retry, recovery
   api/schemas.py          response models
   core/config.py          settings from environment
+  core/logging.py         log format, request-id filter
   database/connection.py  engine, sessions, declarative base
   models/job.py           job model and states
   services/attachment.py  validation, storage, inspection
@@ -85,6 +90,8 @@ tests/
   test_failures.py        retries, permanent failures, recovery
   test_concurrency.py     eight threads race for one job
   test_postgres.py        same guarantees against PostgreSQL
+  test_observability.py   request ids, log format, health
+  test_startup.py         startup retries when the database is late
 docker-compose.yml        api + worker + beat + redis + postgres
 ```
 
@@ -193,6 +200,32 @@ pytest tests/test_postgres.py -v
 That file recreates the `jobs` table, then repeats the eight-thread claim race
 and a full process-and-persist cycle on PostgreSQL, proving the transitions do
 not depend on SQLite behaviour.
+
+## Observability
+
+Every request gets a correlation id:
+
+- a client may send `X-Request-ID`; otherwise the API generates a 16-character
+  hex id;
+- the id is always returned in the `X-Request-ID` response header, including on
+  `404` and `422` responses;
+- the access log line carries the same id, so a response can be matched to its
+  log entry even under concurrent traffic.
+
+```
+2026-11-14 02:23:05,601 INFO [trace-final-99] app.main: POST /api/uploads -> 202 in 202ms
+2026-11-14 02:23:05,685 INFO/ForkPoolWorker-2 Job 7524814d-... completed on attempt 1
+```
+
+Both lines carry the job id, so an upload can be followed from the API into the
+worker. Uvicorn's own loggers are routed through the same handler instead of
+keeping a second, differently formatted stream.
+
+`GET /health` reports the application version, the environment and broker
+reachability. Startup retries a refused database connection
+(`ASYNCFFLOW_DATABASE_CONNECT_ATTEMPTS`, default 10, with a 1.5s delay), which
+covers a database container that is healthy a moment before it accepts
+connections.
 
 ## Design notes
 

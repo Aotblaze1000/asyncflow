@@ -22,6 +22,8 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.models.job import Job
@@ -49,11 +51,15 @@ class JobRunResult:
 
 
 #: Errors that a later attempt may resolve on its own (a half-written file, a
-#: transient IO problem). Anything else is treated as a logic error.
+#: transient IO problem, an oversized document hitting the soft time limit).
+#: A soft time limit is deliberately retryable: the job had started, so failing
+#: it permanently because one attempt was slow would lose work that a longer
+#: window might finish.
 RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
     CorruptAttachmentError,
     OSError,
     TimeoutError,
+    SoftTimeLimitExceeded,
 )
 
 
