@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # (for example because a worker was killed) and may be re-queued.
     job_stale_after_seconds: int = 300
 
+    # Database startup resilience
+    database_connect_attempts: int = 10
+    database_connect_delay_seconds: float = 1.5
+
     @property
     def broker_url(self) -> str:
         return self.celery_broker_url or self.redis_url

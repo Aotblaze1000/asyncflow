@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -78,3 +83,38 @@ def init_db() -> None:
     from app import models  # noqa: F401  (register mappers)
 
     Base.metadata.create_all(bind=engine)
+
+
+def init_db_with_retry(
+    attempts: int | None = None, delay_seconds: float | None = None
+) -> None:
+    """Create tables, tolerating a database that is still coming up.
+
+    A container can be healthy a moment before it accepts connections, and a
+    managed database can briefly refuse traffic during a failover. Exiting on
+    the first refused connection turns a few seconds of unavailability into a
+    crash loop, so the startup path retries with a bounded budget instead.
+    """
+
+    remaining = attempts or settings.database_connect_attempts
+    delay = (
+        settings.database_connect_delay_seconds if delay_seconds is None else delay_seconds
+    )
+
+    for attempt in range(1, remaining + 1):
+        try:
+            init_db()
+            return
+        except OperationalError:
+            if attempt == remaining:
+                logger.error(
+                    "Database still unreachable after %s attempt(s); giving up", attempt
+                )
+                raise
+            logger.warning(
+                "Database not ready (attempt %s/%s); retrying in %.1fs",
+                attempt,
+                remaining,
+                delay,
+            )
+            time.sleep(delay)
